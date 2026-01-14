@@ -244,6 +244,7 @@ export class BTCPServer {
    */
   private handleMessage(req: IncomingMessage, res: ServerResponse, params: URLSearchParams): void {
     const sessionId = params.get('sessionId');
+    const clientId = params.get('clientId');
 
     if (!sessionId) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -259,8 +260,8 @@ export class BTCPServer {
     req.on('end', () => {
       try {
         const message = parseMessage(body);
-        this.log(`Message received for session ${sessionId}`, message);
-        this.routeMessage(sessionId, message);
+        this.log(`Message received for session ${sessionId} from client ${clientId}`, message);
+        this.routeMessage(sessionId, message, clientId ?? undefined);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
@@ -274,10 +275,41 @@ export class BTCPServer {
   }
 
   /**
+   * Find the sender client by client ID or fall back to session-based lookup
+   */
+  private findSenderClient(sessionId: string, clientId?: string): SSEClient | undefined {
+    // If clientId is provided, use it directly
+    if (clientId) {
+      return this.clients.get(clientId);
+    }
+
+    const session = this.sessions.get(sessionId);
+
+    // First, check if an agent in this session sent the message
+    // Agents post to the joined session's ID
+    if (session) {
+      // Return the most recently active agent (simplification)
+      for (const agent of session.agentClients.values()) {
+        return agent;
+      }
+    }
+
+    // Check if this is a client's own session (for initial connection messages)
+    for (const client of this.clients.values()) {
+      if (client.sessionId === sessionId) {
+        return client;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
    * Route a message to appropriate handler
    */
-  private routeMessage(sessionId: string, message: JsonRpcMessage): void {
+  private routeMessage(sessionId: string, message: JsonRpcMessage, clientId?: string): void {
     const session = this.sessions.get(sessionId);
+    const senderClient = this.findSenderClient(sessionId, clientId);
 
     if (isResponse(message)) {
       // Handle response (from browser to agent)
@@ -297,19 +329,19 @@ export class BTCPServer {
         break;
 
       case 'tools/list':
-        this.handleToolsList(session, message);
+        this.handleToolsList(session, message, senderClient);
         break;
 
       case 'tools/call':
-        this.handleToolsCall(session, message);
+        this.handleToolsCall(session, message, senderClient);
         break;
 
       case 'session/join':
-        this.handleSessionJoin(sessionId, message);
+        this.handleSessionJoin(sessionId, message, clientId);
         break;
 
       case 'ping':
-        this.handlePing(session, message);
+        this.handlePing(session, message, senderClient);
         break;
 
       default:
@@ -348,21 +380,57 @@ export class BTCPServer {
   /**
    * Handle tools/list request
    */
-  private handleToolsList(session: Session | undefined, request: JsonRpcRequest): void {
+  private handleToolsList(session: Session | undefined, request: JsonRpcRequest, senderClient?: SSEClient): void {
     if (!session) {
+      // No session - return empty tools list or error
+      if (senderClient) {
+        this.sendToClient(senderClient, createResponse(request.id, { tools: [] }));
+      }
       return;
     }
 
     // Forward to browser if connected, otherwise return cached tools
     if (session.browserClient) {
-      this.sendToClient(session.browserClient, request);
+      // Store mapping for response routing (same pattern as tools/call)
+      const internalId = generateMessageId();
+      const agentId = senderClient?.id ?? '';
+
+      session.pendingResponses.set(internalId, {
+        agentId,
+        originalId: request.id,
+        timestamp: Date.now(),
+      });
+
+      // Forward to browser with internal ID
+      const forwardedRequest: JsonRpcRequest = {
+        ...request,
+        id: internalId,
+      };
+      this.sendToClient(session.browserClient, forwardedRequest);
+
+      // Set timeout for response
+      setTimeout(() => {
+        const pending = session.pendingResponses.get(internalId);
+        if (pending) {
+          session.pendingResponses.delete(internalId);
+          const agent = session.agentClients.get(pending.agentId);
+          if (agent) {
+            // Return cached tools on timeout
+            this.sendToClient(agent, createResponse(pending.originalId, { tools: session.tools }));
+          }
+        }
+      }, this.config.requestTimeout);
     } else {
       // Return cached tools if no browser connected
       const response = createResponse(request.id, { tools: session.tools });
-      // Find the agent that sent this request and respond
-      for (const agent of session.agentClients.values()) {
-        this.sendToClient(agent, response);
-        break;
+      if (senderClient) {
+        this.sendToClient(senderClient, response);
+      } else {
+        // Fallback: find the agent that sent this request and respond
+        for (const agent of session.agentClients.values()) {
+          this.sendToClient(agent, response);
+          break;
+        }
       }
     }
   }
@@ -370,36 +438,34 @@ export class BTCPServer {
   /**
    * Handle tools/call request
    */
-  private handleToolsCall(session: Session | undefined, request: JsonRpcRequest): void {
+  private handleToolsCall(session: Session | undefined, request: JsonRpcRequest, senderClient?: SSEClient): void {
     if (!session || !session.browserClient) {
-      // No browser connected, return error
-      for (const agent of session?.agentClients.values() ?? []) {
-        this.sendToClient(agent, createErrorResponse(
-          request.id,
-          ErrorCodes.SESSION_ERROR,
-          'No browser client connected to this session'
-        ));
-        break;
+      // No browser connected, return error to sender
+      const errorResponse = createErrorResponse(
+        request.id,
+        ErrorCodes.SESSION_ERROR,
+        'No browser client connected to this session'
+      );
+      if (senderClient) {
+        this.sendToClient(senderClient, errorResponse);
+      } else {
+        for (const agent of session?.agentClients.values() ?? []) {
+          this.sendToClient(agent, errorResponse);
+          break;
+        }
       }
       return;
     }
 
     // Store mapping for response routing
     const internalId = generateMessageId();
+    const agentId = senderClient?.id ?? '';
+
     session.pendingResponses.set(internalId, {
-      agentId: '', // Will be set when we know which agent sent this
+      agentId,
       originalId: request.id,
       timestamp: Date.now(),
     });
-
-    // Find which agent sent this (simple approach: use first agent)
-    for (const [agentId] of session.agentClients) {
-      const pending = session.pendingResponses.get(internalId);
-      if (pending) {
-        pending.agentId = agentId;
-      }
-      break;
-    }
 
     // Forward to browser with internal ID
     const forwardedRequest: JsonRpcRequest = {
@@ -455,16 +521,21 @@ export class BTCPServer {
   /**
    * Handle session/join request
    */
-  private handleSessionJoin(currentSessionId: string, request: JsonRpcRequest): void {
+  private handleSessionJoin(currentSessionId: string, request: JsonRpcRequest, clientId?: string): void {
     const { sessionId: targetSessionId } = request.params as { sessionId: string };
     const targetSession = this.sessions.get(targetSessionId);
 
     // Find the client that sent this request
     let client: SSEClient | undefined;
-    for (const c of this.clients.values()) {
-      if (c.sessionId === currentSessionId && c.type === 'agent') {
-        client = c;
-        break;
+    if (clientId) {
+      client = this.clients.get(clientId);
+    } else {
+      // Fallback: search for client by session ID
+      for (const c of this.clients.values()) {
+        if (c.sessionId === currentSessionId && c.type === 'agent') {
+          client = c;
+          break;
+        }
       }
     }
 
@@ -481,8 +552,7 @@ export class BTCPServer {
       return;
     }
 
-    // Update client's session
-    client.sessionId = targetSessionId;
+    // Add agent to target session (don't change client.sessionId - agent will post to target session)
     targetSession.agentClients.set(client.id, client);
 
     this.log(`Agent ${client.id} joined session ${targetSessionId}`);
@@ -497,14 +567,13 @@ export class BTCPServer {
   /**
    * Handle ping request
    */
-  private handlePing(session: Session | undefined, request: JsonRpcRequest): void {
-    if (!session) return;
-
-    // Respond to the sender
+  private handlePing(session: Session | undefined, request: JsonRpcRequest, senderClient?: SSEClient): void {
     const response = createPongResponse(request.id);
 
-    // Send to browser if from browser, or to agents if from agent
-    if (session.browserClient) {
+    // Respond to the sender
+    if (senderClient) {
+      this.sendToClient(senderClient, response);
+    } else if (session?.browserClient) {
       this.sendToClient(session.browserClient, response);
     }
   }
