@@ -499,13 +499,13 @@ export class BTCPServer {
       return;
     }
 
-    const pending = session.pendingResponses.get(response.id);
+    const pending = session.pendingResponses.get(String(response.id));
     if (!pending) {
       this.log(`No pending request found for response ${response.id}`);
       return;
     }
 
-    session.pendingResponses.delete(response.id);
+    session.pendingResponses.delete(String(response.id));
 
     // Find the agent and forward the response with original ID
     const agent = session.agentClients.get(pending.agentId);

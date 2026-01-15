@@ -6,6 +6,7 @@
  * - HTTP POST for sending messages
  */
 
+import type { IncomingMessage } from 'http';
 import type {
   BTCPClientConfig,
   BTCPClientEventName,
@@ -61,15 +62,15 @@ if (typeof EventSource !== 'undefined') {
       try {
         // Use Node.js http/https modules
         const urlObj = new URL(this.url);
-        const http = await import(urlObj.protocol === 'https:' ? 'https' : 'http');
+        const httpModule = await import(urlObj.protocol === 'https:' ? 'https' : 'http');
 
-        const req = http.request(this.url, {
+        const req = httpModule.request(this.url, {
           method: 'GET',
           headers: {
             'Accept': 'text/event-stream',
             'Cache-Control': 'no-cache',
           },
-        }, (res) => {
+        }, (res: IncomingMessage) => {
           if (res.statusCode !== 200) {
             this.readyState = 2;
             if (this.onerror) {

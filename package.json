@@ -1,6 +1,7 @@
 {
   "name": "btcp-client",
   "version": "1.0.0",
+  "type": "module",
   "description": "Browser Tool Calling Protocol - Client and Server implementation",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
